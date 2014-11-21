@@ -1,6 +1,11 @@
 #ifndef _473_MM_H
 #define _473_MM_H
 
+enum policy {
+	POLICY_FIFO = 1,
+	POLICY_CLOCK
+};
+
 /*
 'mm_init()' initializes the memory management system. 
 'vm' denotes the pointer to the start of virtual address space, 
