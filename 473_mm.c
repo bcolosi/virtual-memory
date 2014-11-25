@@ -3,7 +3,7 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <sys/mman.h>
-#include <unistd.h>
+#include <unistd.h> // potentially unnecessary. I'll check later.
 
 #include <stdio.h>
 #include <stdarg.h>
@@ -73,7 +73,7 @@ void mm_init(void* vm, int vm_size, int n_frames, int page_size, int policy) {
 
 		mprotect(vm, vm_size, PROT_NONE);
 		mem_start = vm;
-		PAGE_SIZE = getpagesize();
+		PAGE_SIZE = page_size;
 
 		break;
 	}
