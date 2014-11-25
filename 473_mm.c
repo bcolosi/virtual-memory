@@ -48,6 +48,15 @@ void mm_init(void* vm, int vm_size, int n_frames, int page_size, int policy) {
 	switch(policy) {
 		case POLICY_FIFO:
 
+		struct sigaction action;
+		action.sa_sigaction = fifo_handler;
+		action.sa_flags = SA_SIGINFO;
+		sigaction(SIGSEGV, &action, NULL);
+
+		mprotect(vm, vm_size, PROT_NONE);
+		mem_start = vm;
+		PAGE_SIZE = page_size;
+		
 		break;
 		case POLICY_CLOCK:
 
@@ -145,6 +154,10 @@ static void clock_handler(int v, siginfo_t *si, void *context) {
 	pool = pool->next;
 	dump();
 	debug(2, "Exiting signal handler.\n");
+}
+
+static void fifo_handler(int v, siginfo_t *si, void *context) {
+
 }
 
 unsigned long mm_report_npage_faults() {
