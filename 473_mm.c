@@ -34,29 +34,56 @@ struct rmem {
 	struct rmem *next;
 };
 
+// Frame struct used in FIFO implementation
+struct fifo_frame {
+	int frame;
+	int accessed;
+	int dirty;
+	struct fifo_frame *next;
+};
+
+
 // pool of resident memory.
 static struct rmem *pool;
+static struct fifo_frame *fifo_pool;
 static int num_frames;
 static void* mem_start;
 static int PAGE_SIZE;
 static int page_faults = 0, write_backs = 0;
 
 static void clock_handler(int, siginfo_t*, void*);
+static void fifo_handler(int v, siginfo_t *si, void *context);
 
 void mm_init(void* vm, int vm_size, int n_frames, int page_size, int policy) {
 	debug(1, "mm_init called: vm %p, vm_size: 0x%x, n_frames: %d, page_size: 0x%x, policy: %d\n", vm, vm_size, n_frames, page_size, policy);
 	switch(policy) {
 		case POLICY_FIFO:
 
-		struct sigaction action;
-		action.sa_sigaction = fifo_handler;
-		action.sa_flags = SA_SIGINFO;
-		sigaction(SIGSEGV, &action, NULL);
+		fifo_pool = malloc(sizeof(struct fifo_frame) * n_frames);
+		
+		int i;
+		for(i = 0; i < n_frames; i++)
+		{
+			fifo_pool[i].frame = -1;
+			fifo_pool[i].accessed = 0;
+			fifo_pool[i].dirty = 0;
+			fifo_pool[i].next = &fifo_pool[i+1];
+		}
+		fifo_pool[i-1].next = NULL;
+		//for (i = 0; i < n_frames; i++) {
+		//	printf("pool[%d] addr: %p; next: %p\n", i, &fifo_pool[i], fifo_pool[i].next);
+		//}
+
+		struct sigaction fifo_action;
+		fifo_action.sa_sigaction = fifo_handler;
+		fifo_action.sa_flags = SA_SIGINFO;
+		sigaction(SIGSEGV, &fifo_action, NULL);
 
 		mprotect(vm, vm_size, PROT_NONE);
 		mem_start = vm;
 		PAGE_SIZE = page_size;
-		
+		num_frames = n_frames;	
+	
 		break;
 		case POLICY_CLOCK:
 
@@ -157,7 +184,71 @@ static void clock_handler(int v, siginfo_t *si, void *context) {
 }
 
 static void fifo_handler(int v, siginfo_t *si, void *context) {
+	int page = (int) (si->si_addr - mem_start) / PAGE_SIZE;
+	
+	//check if page is present if physical memory
+	//struct fifo_frame *trace = fifo_pool;
+	int i;
+	for(i = 0; i < num_frames; i++)
+	{
+		if(fifo_pool[i].frame == page)
+		{
+			if(fifo_pool[i].accessed)
+			{
+				fifo_pool[i].dirty = 1;
+				mprotect(page*PAGE_SIZE + mem_start, PAGE_SIZE, PROT_READ | PROT_WRITE);
+			}
+			else
+			{
+			  fifo_pool[i].accessed = 1;
+			  if (fifo_pool[i].dirty == 1)
+			  {
+			  	mprotect(page*PAGE_SIZE + mem_start, PAGE_SIZE, PROT_READ | PROT_WRITE);
+			  }
+			  else
+			  {
+			  	mprotect(page*PAGE_SIZE + mem_start, PAGE_SIZE, PROT_READ);
+			  }
+			}
+			//for (i = 0; i < num_frames; i++) {
+			//	printf("pool[%d] page: %d; dirty: %d\n", i, fifo_pool[i].frame, fifo_pool[i].dirty);
+			//}
+			return;
+		}
+	}
 
+	//If we reach this point, page is not in memory
+	page_faults++;
+	
+	int evicted_page = fifo_pool[0].frame;
+
+	if(fifo_pool[0].dirty == 1)
+	{
+		write_backs++;
+	}
+	for(i = 0; i < num_frames - 1; i++)
+	{
+		fifo_pool[i].frame = fifo_pool[i+1].frame;
+		fifo_pool[i].accessed = fifo_pool[i+1].accessed;
+		fifo_pool[i].dirty = fifo_pool[i+1].dirty;
+	}
+	fifo_pool[i].frame = page;
+	fifo_pool[i].accessed = 0;
+	fifo_pool[i].dirty = 0;
+
+	if(evicted_page != -1)
+	{
+		mprotect(evicted_page*PAGE_SIZE + mem_start, PAGE_SIZE, PROT_NONE);
+	}
+
+	//for (i = 0; i < num_frames; i++) {
+	//	printf("pool[%d] page: %d; dirty: %d\n", i, fifo_pool[i].frame, fifo_pool[i].dirty);
+	//}
+}
+
+static void replace_oldest (struct fifo_frame *to_push)
+{
+	fifo_pool = fifo_pool->next;
 }
 
 unsigned long mm_report_npage_faults() {
