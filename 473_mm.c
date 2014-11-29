@@ -185,7 +185,7 @@ static void clock_handler(int v, siginfo_t *si, void *context) {
 
 static void fifo_handler(int v, siginfo_t *si, void *context) {
 	int page = (int) (si->si_addr - mem_start) / PAGE_SIZE;
-	
+
 	//check if page is present if physical memory
 	//struct fifo_frame *trace = fifo_pool;
 	int i;
@@ -193,26 +193,8 @@ static void fifo_handler(int v, siginfo_t *si, void *context) {
 	{
 		if(fifo_pool[i].frame == page)
 		{
-			if(fifo_pool[i].accessed)
-			{
-				fifo_pool[i].dirty = 1;
-				mprotect(page*PAGE_SIZE + mem_start, PAGE_SIZE, PROT_READ | PROT_WRITE);
-			}
-			else
-			{
-			  fifo_pool[i].accessed = 1;
-			  if (fifo_pool[i].dirty == 1)
-			  {
-			  	mprotect(page*PAGE_SIZE + mem_start, PAGE_SIZE, PROT_READ | PROT_WRITE);
-			  }
-			  else
-			  {
-			  	mprotect(page*PAGE_SIZE + mem_start, PAGE_SIZE, PROT_READ);
-			  }
-			}
-			//for (i = 0; i < num_frames; i++) {
-			//	printf("pool[%d] page: %d; dirty: %d\n", i, fifo_pool[i].frame, fifo_pool[i].dirty);
-			//}
+			fifo_pool[i].dirty = 1;
+			mprotect(page*PAGE_SIZE + mem_start, PAGE_SIZE, PROT_READ | PROT_WRITE);
 			return;
 		}
 	}
@@ -236,19 +218,12 @@ static void fifo_handler(int v, siginfo_t *si, void *context) {
 	fifo_pool[i].accessed = 0;
 	fifo_pool[i].dirty = 0;
 
+	mprotect(page*PAGE_SIZE + mem_start, PAGE_SIZE, PROT_READ);
+
 	if(evicted_page != -1)
 	{
 		mprotect(evicted_page*PAGE_SIZE + mem_start, PAGE_SIZE, PROT_NONE);
 	}
-
-	//for (i = 0; i < num_frames; i++) {
-	//	printf("pool[%d] page: %d; dirty: %d\n", i, fifo_pool[i].frame, fifo_pool[i].dirty);
-	//}
-}
-
-static void replace_oldest (struct fifo_frame *to_push)
-{
-	fifo_pool = fifo_pool->next;
 }
 
 unsigned long mm_report_npage_faults() {
