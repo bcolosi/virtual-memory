@@ -3,7 +3,7 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <sys/mman.h>
-#include <unistd.h> // potentially unnecessary. I'll check later.
+#include <string.h>
 
 #include <stdio.h>
 #include <stdarg.h>
@@ -24,6 +24,7 @@ static void debug(int level, const char *fmt, ...) {
 	fprintf(stderr, "\033[00m");
 	va_end(args);
 }
+#define debug(...) 
 
 // Struct denoting a page which is resident in memory.
 struct rmem {
@@ -37,9 +38,7 @@ struct rmem {
 // Frame struct used in FIFO implementation
 struct fifo_frame {
 	int frame;
-	int accessed;
 	int dirty;
-	struct fifo_frame *next;
 };
 
 
@@ -65,11 +64,8 @@ void mm_init(void* vm, int vm_size, int n_frames, int page_size, int policy) {
 		for(i = 0; i < n_frames; i++)
 		{
 			fifo_pool[i].frame = -1;
-			fifo_pool[i].accessed = 0;
 			fifo_pool[i].dirty = 0;
-			fifo_pool[i].next = &fifo_pool[i+1];
 		}
-		fifo_pool[i-1].next = NULL;
 		//for (i = 0; i < n_frames; i++) {
 		//	printf("pool[%d] addr: %p; next: %p\n", i, &fifo_pool[i], fifo_pool[i].next);
 		//}
@@ -208,14 +204,10 @@ static void fifo_handler(int v, siginfo_t *si, void *context) {
 	{
 		write_backs++;
 	}
-	for(i = 0; i < num_frames - 1; i++)
-	{
-		fifo_pool[i].frame = fifo_pool[i+1].frame;
-		fifo_pool[i].accessed = fifo_pool[i+1].accessed;
-		fifo_pool[i].dirty = fifo_pool[i+1].dirty;
-	}
+	memmove(&fifo_pool[0], &fifo_pool[1], (num_frames - 1) * sizeof(struct fifo_frame));
+
+	i = num_frames - 1;
 	fifo_pool[i].frame = page;
-	fifo_pool[i].accessed = 0;
 	fifo_pool[i].dirty = 0;
 
 	mprotect(page*PAGE_SIZE + mem_start, PAGE_SIZE, PROT_READ);
