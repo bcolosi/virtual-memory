@@ -1,0 +1,23 @@
+Compilation:
+To make this project, no special compilation options are needed.
+
+Contributions:
+Jackson Burlew: Clock Replacement Algorithm
+Seamus Hayes: FIFO Algorithm
+
+FIFO Description:
+
+FIFO replacement is a very simple algorithm.  We maintain an array with as many entries
+as possible frames. The array type is a custom struct that holds the frame number and a dirty
+bool.  When the policy is initiated, reads and writes are protected on the entire block of
+memory.  Upon attempting to access a restricted block, the fifo_handler funtion is called.
+If the faulting page is not present in memroy, the handler evicts the oldest page
+(the first one in the array) and adds the new page to the array. Read permissions are
+enabled on all new adds.  If a page faults that is in memory, we assume a write fault
+and add write permission to the page.
+
+Clock Replacement Description:
+
+
+We assume only reads and writes to the memory, no execute calls. (This is
+probably a fine assumption )
