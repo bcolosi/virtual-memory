@@ -24,3 +24,4 @@ clean:
 	gcc -c $(CFLAGS) -o $@ $<
 
 package:
+	tar -cvzf Burlew-Hayes.tgz 473_mm.c 473_mm.h proj-description.txt

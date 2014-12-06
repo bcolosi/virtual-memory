@@ -118,6 +118,7 @@ static void dump() {
 		trace = trace->next;
 	} while (trace != pool);
 }
+#define dump()
 
 static void clock_handler(int v, siginfo_t *si, void *context) {
 	int page = (int) (si->si_addr - mem_start) / PAGE_SIZE;
