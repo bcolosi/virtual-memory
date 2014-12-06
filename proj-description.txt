@@ -19,7 +19,19 @@ setting the dirty field. When a page with a non-zero dirty field is evicted,
 the write_back counter is incremented.
 
 Clock Replacement Description:
-
+	The clock replacement algorithm uses a circularly linked list to keep track
+of the pages in memory. If a segfault occurs, we search the list and set the
+accessed bit to 1. If the accessed bit is already 1, then the page has write-
+protection only which makes the operation a write, so we know to set the dirty
+bit.
+	On a page fault, we iterate through the list and if the accessed bit is 0,
+we swap it out, writing back if necessary. Otherwise, we set accessed to 0, then
+set the head to be the next element.
+	Asymptotic analysis shows that on a segfault, we loop through the entire
+linked list. When we choose which memory page to swap out, we can at most loop
+through the entire linked list once before returning to the start which is
+guaranteed to have its accessed bit set to 0, ending the loop. Thus, we are
+bounded by O(n), where n is the number of pages in memory.
 
 We assume only reads and writes to the memory, no execute calls. (This is
 probably a fine assumption )
