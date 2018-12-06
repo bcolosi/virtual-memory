@@ -1,228 +1,338 @@
-#include "473_mm.h"
-#include <sys/types.h>
-#include <signal.h>
-#include <stdlib.h>
-#include <sys/mman.h>
-#include <string.h>
-
+#define _GNU_SOURCE 1
 #include <stdio.h>
-#include <stdarg.h>
-#define DEBUG_LEVEL 0b11011000
+#include <stdlib.h>
+#include <stdbool.h>
+#include <sys/mman.h>
+#include <signal.h>
+#include "473_mm.h"
 
-static void debug(int level, const char *fmt, ...) {
-	if (!(level & DEBUG_LEVEL))
-		return;
-	va_list args;
-	va_start(args, fmt);
+#define FIFO ((int) 1)
+#define TCR ((int) 2)
 
-	// Provide color coding.
-	int k = 0;
-	while (level > 0)
-		k++, level >>= 1;
-	fprintf(stderr, "\033[%dm", 30 + k);
-	vfprintf(stderr, fmt, args);
-	fprintf(stderr, "\033[00m");
-	va_end(args);
-}
-#define debug(...) 
-
-// Struct denoting a page which is resident in memory.
-struct rmem {
-	unsigned int frame;
-	int accessed : 1;
-	int dirty : 1;
-	// gap of 30 bits here on a 64 bit machine.
-	struct rmem *next;
-};
-
-// Frame struct used in FIFO implementation
-struct fifo_frame {
-	int frame;
-	int dirty;
-};
+#define READ ((int) 0)
+#define WRITE ((int) 1)
+#define NRW ((int) 2)
 
 
-// pool of resident memory.
-static struct rmem *pool;
-static struct fifo_frame *fifo_pool;
-static int num_frames;
-static void* mem_start;
-static int PAGE_SIZE;
-static int page_faults = 0, write_backs = 0;
+// GLOBALS **************************************************
+void* vmSTART = NULL;
+int vmSIZE = 0;
+int max_phys_pages = 0;
+int pageSIZE = 0;
+int policy_type = 0;
+int frame_number_counter = 1;
 
-static void clock_handler(int, siginfo_t*, void*);
-static void fifo_handler(int v, siginfo_t *si, void *context);
+int current_pages = 0;
 
-void mm_init(void* vm, int vm_size, int n_frames, int page_size, int policy) {
-	debug(1, "mm_init called: vm %p, vm_size: 0x%x, n_frames: %d, page_size: 0x%x, policy: %d\n", vm, vm_size, n_frames, page_size, policy);
-	switch(policy) {
-		case POLICY_FIFO:
+// STRUCTS **************************************************
+struct queue{
+    int page_num;
+    int write_back;
+    int phys_addr;
+    int reference;
+    int third_chance; 
+    int frame;
+    struct queue* next;
+} queue;
 
-		fifo_pool = malloc(sizeof(struct fifo_frame) * n_frames);
-		
-		int i;
-		for(i = 0; i < n_frames; i++)
-		{
-			fifo_pool[i].frame = -1;
-			fifo_pool[i].dirty = 0;
-		}
-		//for (i = 0; i < n_frames; i++) {
-		//	printf("pool[%d] addr: %p; next: %p\n", i, &fifo_pool[i], fifo_pool[i].next);
-		//}
+struct queue* PM_queue = NULL;
+struct queue* evict_page = NULL;
 
-		struct sigaction fifo_action;
-		fifo_action.sa_sigaction = fifo_handler;
-		fifo_action.sa_flags = SA_SIGINFO;
-		sigaction(SIGSEGV, &fifo_action, NULL);
+// HELPER FUNCTIONS *****************************************
 
-		mprotect(vm, vm_size, PROT_NONE);
-		mem_start = vm;
-		PAGE_SIZE = page_size;
-		num_frames = n_frames;	
-	
-		break;
-		case POLICY_CLOCK:
+// can call append for TCR if no evictions
+void append(int page_num, int phys_addr, int frame){
+    if(policy_type == FIFO){
+        if(PM_queue == NULL){
+            PM_queue = (struct queue*)malloc(sizeof(struct queue));
+            PM_queue->page_num = page_num;
+            PM_queue->write_back = 0;
+            PM_queue->frame = frame;
+            PM_queue->phys_addr = phys_addr;
+            PM_queue->next = NULL;
+        }
+        else{
+            struct queue* tmp = PM_queue;
+            while(tmp->next != NULL){
+                tmp = tmp->next;
+            }
+            tmp->next = (struct queue*)malloc(sizeof(struct queue));
+            tmp = tmp->next;
+            tmp->page_num = page_num;
+            tmp->write_back = 0;
+            tmp->phys_addr = phys_addr;
+            tmp->frame = frame;
+            tmp->next = NULL;
+        }
+    }
+    else if(policy_type == TCR){
+        if(current_pages > max_phys_pages){
+            printf("Error: Can't append page!\n");
+        }
+        if(PM_queue == NULL){
+            PM_queue = (struct queue*)malloc(sizeof(struct queue));
+            PM_queue->page_num = page_num;
+            PM_queue->write_back = 0;
+            PM_queue->phys_addr = phys_addr;
+            PM_queue->reference = 1;
+            PM_queue->third_chance = 0;
+            PM_queue->next = PM_queue;
+            PM_queue->frame = frame;
+            evict_page = PM_queue;
+        }
+        else{
+            struct queue* tmp = PM_queue;
+            while(tmp->next != PM_queue){
+                tmp = tmp->next;
+            }
+            tmp->next = (struct queue*)malloc(sizeof(struct queue));
+            tmp = tmp->next;
+            tmp->page_num = page_num;
+            tmp->write_back = 0;
+            tmp->phys_addr = phys_addr;
+            tmp->reference = 1;
+            tmp->third_chance = 0;
+            tmp->next = PM_queue;
+            tmp->frame = frame;
+            evict_page = PM_queue;
+        }
+    }
+    else{
+        printf("Invalid policy_type: %d\n", policy_type);
+    }
 
-		// Allocate memory to hold all the resident frames.
-		pool = malloc(sizeof(struct rmem) * n_frames);
-		{
-			int i;
-			for (i = 0; i < n_frames; i++) {
-				pool[i].frame = -1;
-				pool[i].accessed = 0;
-				pool[i].dirty = 0;
-				pool[i].next = &pool[(i+1) % n_frames];
-			}
-			for (i = 0; i < n_frames; i++) {
-				debug(2, "pool[%d] addr: %p; next: %p\n", i, &pool[i], pool[i].next);
-			}
-		}
-
-		struct sigaction action;
-		action.sa_sigaction = clock_handler;
-		action.sa_flags = SA_SIGINFO;
-		sigaction(SIGSEGV, &action, NULL);
-
-		mprotect(vm, vm_size, PROT_NONE);
-		mem_start = vm;
-		PAGE_SIZE = page_size;
-
-		break;
-	}
-}
-
-static void dump() {
-	struct rmem *trace = pool;
-	do {
-		debug(32, "%p; frame: %d, accessed: %d, dirty: %d, next: %p\n", trace, trace->frame, trace->accessed, trace->dirty, trace->next);
-		trace = trace->next;
-	} while (trace != pool);
-}
-#define dump()
-
-static void clock_handler(int v, siginfo_t *si, void *context) {
-	int page = (int) (si->si_addr - mem_start) / PAGE_SIZE;
-	debug(2, "SIGSEGV received: addr: %p\n", si->si_addr);
-	struct rmem *trace = pool;
-	int i;
-	dump();
-
-	debug(4, "page: %d", page);
-	// Check to see if the memory is already resident.
-	// If so, we should set its accessed bit or dirty bit,
-	// depending on the style of modification.
-	do {
-		if (trace->frame == page) {
-			debug(4, "; in-memory: %p", trace);
-			if (trace->accessed) {
-				debug(4, "; writing\n");
-				trace->dirty = 1;
-				mprotect(page*PAGE_SIZE + mem_start, PAGE_SIZE, PROT_READ | PROT_WRITE);
-			} else {
-				debug(4, "; reading\n");
-				trace->accessed = 1;
-				if (trace->dirty) {
-					mprotect(page*PAGE_SIZE + mem_start, PAGE_SIZE, PROT_READ | PROT_WRITE);
-				} else {
-					mprotect(page*PAGE_SIZE + mem_start, PAGE_SIZE, PROT_READ);
-				}
-			}
-			dump();
-			debug(2, "Exiting signal handler.\n");
-			return;
-		}
-		trace = trace->next;
-	} while (trace != pool);
-
-	page_faults++;
-	debug(4, "; not in memory [%d]", page_faults);
-
-	// If the memory is not resident, we should evict the next bad element.
-	while (pool->accessed) {
-		pool->accessed = 0;
-		// still dirty, but we should prevent reading so that we know if it gets accessed again.
-		mprotect(pool->frame*PAGE_SIZE + mem_start, PAGE_SIZE, PROT_NONE);
-		pool = pool->next;
-	}
-	debug(4, "; evicting: %d", pool->frame);
-	if (pool->dirty) {
-		debug(4, "; dirty");
-		write_backs++;
-	}
-	debug(4, "; emplace: %p\n", pool);
-	pool->frame = page;
-	pool->accessed = 1;
-	mprotect(page*PAGE_SIZE + mem_start, PAGE_SIZE, PROT_READ);
-	pool->dirty = 0;
-
-	pool = pool->next;
-	dump();
-	debug(2, "Exiting signal handler.\n");
+    return;
 }
 
-static void fifo_handler(int v, siginfo_t *si, void *context) {
-	int page = (int) (si->si_addr - mem_start) / PAGE_SIZE;
-
-	//check if page is present if physical memory
-	//struct fifo_frame *trace = fifo_pool;
-	int i;
-	for(i = 0; i < num_frames; i++)
-	{
-		if(fifo_pool[i].frame == page)
-		{
-			fifo_pool[i].dirty = 1;
-			mprotect(page*PAGE_SIZE + mem_start, PAGE_SIZE, PROT_READ | PROT_WRITE);
-			return;
-		}
-	}
-
-	//If we reach this point, page is not in memory
-	page_faults++;
-	
-	int evicted_page = fifo_pool[0].frame;
-
-	if(fifo_pool[0].dirty == 1)
-	{
-		write_backs++;
-	}
-	memmove(&fifo_pool[0], &fifo_pool[1], (num_frames - 1) * sizeof(struct fifo_frame));
-
-	i = num_frames - 1;
-	fifo_pool[i].frame = page;
-	fifo_pool[i].dirty = 0;
-
-	mprotect(page*PAGE_SIZE + mem_start, PAGE_SIZE, PROT_READ);
-
-	if(evicted_page != -1)
-	{
-		mprotect(evicted_page*PAGE_SIZE + mem_start, PAGE_SIZE, PROT_NONE);
-	}
+void fifo_remove(){
+    if(PM_queue != NULL){
+        struct queue* tmp = PM_queue->next;
+        free(PM_queue);
+        PM_queue = tmp;
+    } 
+    else{
+        printf("ERROR: Queue is already empty!\n");
+    }
+    return;
 }
 
-unsigned long mm_report_npage_faults() {
-	return page_faults;
+void remove_append(int page_num, int phys_addr){
+    if(PM_queue != NULL){
+        struct queue *tmp = evict_page;
+        tmp->page_num = page_num;
+        tmp->write_back = 0;
+        tmp->phys_addr = phys_addr;
+        tmp->reference = 1;
+        tmp->third_chance = 0;
+
+        return;
+    }
+
+    else{
+        printf("ERROR: Queue is already empty!\n");
+    }
+    return;
 }
 
-unsigned long mm_report_nwrite_backs() {
-	return write_backs;
+void handler(int sig, siginfo_t* info, void* ucontext){
+    struct queue* tmp = PM_queue;
+    int page = (int)(info->si_addr - vmSTART) / pageSIZE;
+    int cause = -1;
+    int evicted_page = -1;
+    int write_back = 0;
+    int offset = ((int)info->si_addr - ((int)vmSTART + page * pageSIZE));
+    int phys_addr = -1;
+    int frame_number = -1;
+    printf("\nOffset: %x\n\n", offset);
+    printf("Entering Handler for Page %d!\n", page);
+
+    if(policy_type == 1){
+
+        printf("Inside handler with FIFO policy!\n");
+
+        if(tmp != NULL){
+            printf("tmp not NULL in FIFO Policy!\n");
+            while(tmp->page_num != page && tmp->next != NULL){
+                printf("Finding page!\n");
+                tmp = tmp->next;
+            }
+        
+            if(tmp->page_num == page){
+                printf("Paged found in FIFO policy!\n");
+                tmp->write_back = 1;
+                frame_number = tmp->frame;
+                mprotect(page*pageSIZE + vmSTART, pageSIZE, PROT_READ | PROT_WRITE);
+                cause = WRITE;
+            }
+            else{
+                current_pages++;
+                if(current_pages > max_phys_pages){  
+                    printf("Evicting page in Policy!\n");
+                    evicted_page = PM_queue->page_num;
+                    frame_number = PM_queue->frame;
+                    write_back = PM_queue->write_back;
+                    if(PM_queue != NULL){
+                        mprotect(vmSTART + (evicted_page * pageSIZE), pageSIZE, PROT_NONE);
+                    }
+                    fifo_remove();
+                    current_pages--;
+                    printf("Page evicted in FIFO policy!\n");
+                    append(page, phys_addr, frame_number);
+                }
+                else{
+                    frame_number = frame_number_counter;
+                    append(page, phys_addr, frame_number);
+                    frame_number_counter++;
+                }
+
+                if(mprotect(vmSTART + (page * pageSIZE), pageSIZE, PROT_READ) == 0){
+                    cause = READ;
+                }
+            }
+        }
+        else{
+            printf("tmp is null!\n");
+            current_pages++;
+            frame_number = 0;
+            append(page, phys_addr, frame_number);
+            
+            if(mprotect(vmSTART + (page * pageSIZE), pageSIZE, PROT_READ) == 0){
+                cause = READ;
+            }
+        }
+
+        phys_addr = (frame_number * pageSIZE) + offset;
+    }
+    else if(policy_type == 2){
+
+        printf("Inside handler with THR policy!\n");
+
+        if(tmp != NULL){
+
+            printf("\n");
+            printf("Page #: %d     %d      %d      %d\n",PM_queue->page_num, PM_queue->next->page_num, PM_queue->next->next->page_num, PM_queue->next->next->next->page_num);
+            printf("Ref  #: %d     %d      %d      %d\n",PM_queue->reference, PM_queue->next->reference, PM_queue->next->next->reference, PM_queue->next->next->next->reference);
+            printf("TCR  #: %d     %d      %d      %d\n",PM_queue->third_chance, PM_queue->next->third_chance, PM_queue->next->next->third_chance, PM_queue->next->next->next->third_chance);
+            printf("\n");
+
+            while(tmp->next != PM_queue){
+                mprotect(tmp->page_num*pageSIZE + vmSTART, pageSIZE, PROT_NONE);
+                tmp = tmp->next;
+            }
+            tmp = PM_queue;
+            printf("tmp not NULL in TCR Policy!\n");
+            while(tmp->page_num != page && tmp->next != PM_queue){
+                printf("Finding page!\n");
+                tmp = tmp->next;
+            }
+        
+            if(tmp->page_num == page){
+                printf("Paged found in TCR policy!\n");
+                frame_number = tmp->frame;
+                if(tmp->reference == 1){
+                    tmp->write_back = 1;
+                    tmp->third_chance = 1;
+                    mprotect(page*pageSIZE + vmSTART, pageSIZE, PROT_READ | PROT_WRITE);
+                    cause = WRITE;
+                }
+                else{
+                    tmp->reference = 1;
+                    if(tmp->third_chance == 1){
+                        mprotect(page*pageSIZE + vmSTART, pageSIZE, PROT_READ);
+                        cause = WRITE;
+                    }
+                    else{
+                        tmp->write_back = 1;
+                        tmp->third_chance = 1;
+                        mprotect(page*pageSIZE + vmSTART, pageSIZE, PROT_READ | PROT_WRITE);
+                        cause = NRW;
+                    }
+                }
+            }
+            else{
+                current_pages++;
+                if(current_pages > max_phys_pages){  
+                    printf("Evicting page in Policy!\n");
+
+                    while(evict_page->reference != 0 || evict_page->third_chance != 0){
+                        if(evict_page->reference == 0){
+                            printf("\nFinding page to evict, third chance set to 0\n\n");
+                            evict_page->third_chance = 0;
+                        }
+                        evict_page->reference = 0;
+                        if(evict_page->third_chance == 1){
+                            mprotect(vmSTART + (evict_page->page_num * pageSIZE), pageSIZE, PROT_NONE);
+                        }
+                        evict_page = evict_page->next;
+                    }                    
+
+                    evicted_page = evict_page->page_num;
+                    frame_number = evict_page->frame;
+                    write_back = evict_page->write_back;
+                    
+                    if(PM_queue != NULL){
+                        mprotect(vmSTART + (evicted_page * pageSIZE), pageSIZE, PROT_NONE);
+                    }
+                    remove_append(page, phys_addr);
+                    current_pages--;
+                    evict_page = evict_page->next;
+                    printf("Page evicted in TCR policy!\n");
+                }
+                else{
+                    printf("\n");
+                    printf("current pages: %d\n", current_pages);
+                    printf("\n");
+                    frame_number = frame_number_counter;
+                    append(page, phys_addr, frame_number);
+                    frame_number_counter ++;
+                }
+
+                if(mprotect(vmSTART + (page * pageSIZE), pageSIZE, PROT_READ) == 0){
+                    cause = READ;
+                }
+            }
+        }
+        else{
+            printf("tmp is null!\n");
+            current_pages++;
+            frame_number = 0;
+            append(page, phys_addr, frame_number);
+            
+            if(mprotect(vmSTART + (page * pageSIZE), pageSIZE, PROT_READ) == 0){
+                cause = READ;
+            }
+        }
+        phys_addr = (frame_number * pageSIZE) + offset;
+    }
+    else{
+        printf("ERROR: Invalid policy type!\n");
+    }
+
+
+    mm_logger(page, cause, evicted_page, write_back, phys_addr);
+    return;
+}
+
+// mm_init ***************************************************
+void mm_init(void* vm, int vm_size, int n_frames, int page_size, int policy)
+{
+    if(policy != FIFO && policy != TCR){
+        printf("ERROR: Invalid policy type.\n");
+        printf("Policy value: %d\n", policy);
+
+        return;
+    }
+
+    vmSTART = vm;
+    vmSIZE = vm_size;
+    max_phys_pages = n_frames;
+    pageSIZE = page_size;
+    policy_type = policy;
+
+    struct sigaction action;
+    action.sa_flags = SA_SIGINFO;
+    action.sa_sigaction = handler;
+
+    sigaction(SIGSEGV, &action, NULL);
+    mprotect(vm, vm_size, PROT_NONE);
 }
